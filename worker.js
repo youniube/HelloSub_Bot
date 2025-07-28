@@ -8,6 +8,7 @@ export default {
         } catch (e) {
             return new Response('错误: ' + e.message, { status: 500 });
         }
+        const botOwnerId = env.BOT_USERID ? parseInt(env.BOT_USERID) : null;
 
         if (url.pathname === '/hook') {
             const webhookUrl = `https://${url.host}`;
@@ -48,21 +49,80 @@ export default {
 
         try {
             if (update.message && update.message.text) {
+                const userId = update.message.from.id;
                 const messageText = update.message.text.trim();
+                
+                // 检查权限
+                const isPublic = await isPublicMode(env);
+                const isOwner = botOwnerId && userId === botOwnerId;
+                
+                if (botOwnerId && !isOwner && !isPublic) {
+                    await sendMessage(botToken, update.message.chat.id, "❌ 此Bot目前仅限创建者使用。创建者可以使用 /open 命令开放给所有人使用。");
+                    return new Response('OK');
+                }
+                
+                if (isOwner) {
+                    if (messageText === '/open') {
+                        await setPublicMode(env, true);
+                        await sendMessage(botToken, update.message.chat.id, "✅ Bot已开放，所有人都可以使用了！");
+                        return new Response('OK');
+                    }
+                    
+                    if (messageText === '/close') {
+                        await setPublicMode(env, false);
+                        await sendMessage(botToken, update.message.chat.id, "🔒 Bot已关闭，只有您可以使用。");
+                        return new Response('OK');
+                    }
+                    
+                    if (messageText === '/status') {
+                        const publicStatus = isPublic ? "开放模式" : "私有模式";
+                        const userIdInfo = botOwnerId ? `\n👤 您的ID：${userId}` : "";
+                        await sendMessage(botToken, update.message.chat.id, `📊 当前状态：${publicStatus}${userIdInfo}`);
+                        return new Response('OK');
+                    }
+                }
+                
                 if (messageText === '/start') {
-                    await sendMessage(botToken, update.message.chat.id, "欢迎使用订阅查询 Bot！请发送订阅链接 URL 以查询流量信息");
+                    let welcomeMsg;
+                    if (isOwner) {
+                        welcomeMsg = "🎉 欢迎回来，主人！\n\n📋 管理命令：\n/open - 开放Bot给所有人使用\n/close - 限制只有您能使用\n/status - 查看Bot状态\n\n直接发送订阅链接即可查询流量！";
+                    } else if (!botOwnerId) {
+                        welcomeMsg = "🎉 欢迎使用订阅查询Bot！\n\n直接发送订阅链接即可查询流量信息。";
+                    } else {
+                        welcomeMsg = "🎉 欢迎使用订阅查询Bot！\n\n直接发送订阅链接即可查询流量信息。";
+                    }
+                    await sendMessage(botToken, update.message.chat.id, welcomeMsg);
                     return new Response('OK');
                 }
+                
                 if (!isValidUrl(messageText)) {
-                    await sendMessage(botToken, update.message.chat.id, "无效的订阅链接！");
+                    await sendMessage(botToken, update.message.chat.id, "❌ 请发送有效的订阅链接！");
                     return new Response('OK');
                 }
+                
                 const info = await querySubscription(messageText);
                 const output = formatOutput(messageText, info);
                 await sendMessage(botToken, update.message.chat.id, escapeMarkdown(output), 'MarkdownV2');
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
+                const userId = update.inline_query.from.id;
                 const subUrl = update.inline_query.query.trim();
+                
+                // 检查权限（内联查询）
+                const isPublic = await isPublicMode(env);
+                const isOwner = botOwnerId && userId === botOwnerId;
+                
+                if (botOwnerId && !isOwner && !isPublic) {
+                    const results = [{
+                        type: "article",
+                        id: "1",
+                        title: "权限不足",
+                        input_message_content: { message_text: "❌ 此Bot目前仅限创建者使用。" }
+                    }];
+                    await answerInlineQuery(botToken, update.inline_query.id, results);
+                    return new Response('OK');
+                }
+                
                 if (!isValidUrl(subUrl)) {
                     await answerInlineQuery(botToken, update.inline_query.id, []);
                     return new Response('OK');
@@ -82,7 +142,7 @@ export default {
                 return new Response('OK');
             } else {
                 if (update.message) {
-                    await sendMessage(botToken, update.message.chat.id, "不支持的消息类型！");
+                    await sendMessage(botToken, update.message.chat.id, "❌ 不支持的消息类型！");
                 }
                 return new Response('OK');
             }
@@ -258,4 +318,18 @@ async function answerInlineQuery(token, queryId, results) {
     } catch (e) {
         console.error('内联异常: ' + e.message);
     }
+}
+
+let publicMode = false;
+
+async function isPublicMode(env) {
+    if (!env.BOT_USERID) {
+        return true;
+    }
+    
+    return publicMode;
+}
+
+async function setPublicMode(env, isPublic) {
+    publicMode = isPublic;
 }

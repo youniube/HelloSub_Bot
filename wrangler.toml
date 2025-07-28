@@ -1,0 +1,8 @@
+name = "HelloSub_Bot"
+main = "worker.js"
+compatibility_date = "2025-07-28"
+usage_model = "bundled"
+
+[vars]
+# BOT_TOKEN 需在 Cloudflare 控制台设置为 Secret
+# BOT_USERID 可选：Bot创建者的用户ID，用于权限控制
