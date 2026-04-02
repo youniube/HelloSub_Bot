@@ -103,8 +103,8 @@ export default {
 
                 await sendMessage(botToken, update.message.chat.id, `⏳ 已识别 ${subUrls.length} 条链接，正在分批查询并回传结果...`);
                 ctx.waitUntil(processSubscriptionsInBatches(botToken, update.message.chat.id, subUrls, {
-                    batchSize: 5,
-                    concurrency: 3
+                    batchSize: 3,
+                    concurrency: 2
                 }));
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
@@ -198,15 +198,21 @@ function isValidUrl(url) {
     }
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function querySubscription(subUrl) {
     const userAgents = [
         "clash-meta",
         "Clash",
-        "Clash Verge/1.7",
-        "Stash/1.0",
-        "sing-box 1.9",
-        "Shadowrocket/2701 CFNetwork/3857.100.1 Darwin/25.0.0 iPhone14,4",
-        "Quantumult X"
+        "sing-box 1.9"
     ];
 
     try {
@@ -216,14 +222,14 @@ async function querySubscription(subUrl) {
         // 逐个 UA 尝试，优先拿到带订阅头信息的响应
         for (const ua of userAgents) {
             try {
-                const res = await fetch(subUrl, {
+                const res = await fetchWithTimeout(subUrl, {
                     method: "GET",
                     headers: {
                         "Accept": "*/*",
                         "User-Agent": ua
                     },
                     redirect: "manual"
-                });
+                }, 9000);
 
                 if (!res.ok) {
                     lastError = new Error(`请求失败，状态码: ${res.status}`);
@@ -350,14 +356,14 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo) {
         for (const candidate of variants) {
             for (const ua of userAgents) {
                 try {
-                    const res = await fetch(candidate, {
+                    const res = await fetchWithTimeout(candidate, {
                         method: "GET",
                         headers: {
                             "Accept": "*/*",
                             "User-Agent": ua
                         },
                         redirect: "manual"
-                    });
+                    }, 7000);
 
                     if (!res.ok) continue;
                     const info = await parseSubscriptionBodyInfo(res.clone());
@@ -693,7 +699,7 @@ function generateProgressBar(percentage) {
     return "[" + "■".repeat(filled) + "□".repeat(totalBlocks - filled) + "]";
 }
 
-async function processSubscriptionsWithLimit(subUrls, concurrency = 3) {
+async function processSubscriptionsWithLimit(subUrls, concurrency = 2) {
     const results = new Array(subUrls.length);
     let index = 0;
 
@@ -706,39 +712,79 @@ async function processSubscriptionsWithLimit(subUrls, concurrency = 3) {
             const subUrl = subUrls[current];
             try {
                 const info = await querySubscription(subUrl);
-                results[current] = formatOutput(subUrl, info);
+                const status = evaluateSubscriptionStatus(info);
+                results[current] = {
+                    text: formatOutput(subUrl, info),
+                    status
+                };
             } catch (e) {
-                results[current] = `订阅链接: ${subUrl}\n查询失败: ${e.message}`;
+                results[current] = {
+                    text: `订阅链接: ${subUrl}\n查询失败: ${e.message}`,
+                    status: 'failed'
+                };
             }
         }
     }
 
-    const count = Math.max(1, Math.min(concurrency, 5));
+    const count = Math.max(1, Math.min(concurrency, 4));
     await Promise.all(Array.from({ length: count }, () => worker()));
     return results;
 }
 
+
 async function processSubscriptionsInBatches(token, chatId, subUrls, options = {}) {
-    const batchSize = Math.max(1, Math.min(options.batchSize || 5, 10));
-    const concurrency = Math.max(1, Math.min(options.concurrency || 3, 5));
+    const batchSize = Math.max(1, Math.min(options.batchSize || 3, 6));
+    const concurrency = Math.max(1, Math.min(options.concurrency || 2, 4));
     const total = subUrls.length;
     const totalBatches = Math.ceil(total / batchSize);
+
+    const summary = { valid: 0, exhausted: 0, expired: 0, failed: 0 };
 
     for (let i = 0; i < totalBatches; i++) {
         const start = i * batchSize;
         const end = Math.min(start + batchSize, total);
         const currentBatch = subUrls.slice(start, end);
 
-        const outputs = await processSubscriptionsWithLimit(currentBatch, concurrency);
+        try {
+            const outputs = await processSubscriptionsWithLimit(currentBatch, concurrency);
 
-        const done = end;
-        const percent = ((done / total) * 100).toFixed(1);
-        const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
-        const progressLine = `✅ 处理进度: ${done}/${total} (${percent}%)`;
+            for (const item of outputs) {
+                if (item.status === 'valid') summary.valid += 1;
+                else if (item.status === 'exhausted') summary.exhausted += 1;
+                else if (item.status === 'expired') summary.expired += 1;
+                else summary.failed += 1;
+            }
 
-        const merged = `${header}\n${progressLine}\n\n${outputs.join("\n\n────────────\n\n")}`;
-        await sendLongMessage(token, chatId, merged);
+            const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
+            const merged = `${header}\n\n${outputs.map(v => v.text).join("\n\n────────────\n\n")}`;
+            await sendLongMessage(token, chatId, merged);
+        } catch (e) {
+            summary.failed += currentBatch.length;
+            await sendMessage(token, chatId, `📦 批次 ${i + 1}/${totalBatches} 处理失败: ${e.message || '未知错误'}`);
+        }
+
+        if (i < totalBatches - 1) {
+            await waitMs(900);
+        }
     }
+
+    await sendMessage(token, chatId, `📊 有效: ${summary.valid} | 耗尽: ${summary.exhausted} | 过期: ${summary.expired} | 失败: ${summary.failed}`);
+    await sendMessage(token, chatId, `✅ 全部批次处理完成，共 ${total} 条。`);
+}
+
+function evaluateSubscriptionStatus(info) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!info || !Number.isFinite(info.total)) return 'failed';
+    if (info.expire > 0 && info.expire <= nowSec) return 'expired';
+
+    const used = (info.upload || 0) + (info.download || 0);
+    const remaining = (info.total || 0) - used;
+    if (remaining <= 0) return 'exhausted';
+    return 'valid';
+}
+
+function waitMs(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function sendLongMessage(token, chatId, text) {
