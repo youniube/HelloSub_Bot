@@ -246,7 +246,12 @@ async function querySubscription(subUrl) {
 
         let configName = extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl);
         let resetDays = null;
-        const bodyInfo = await parseSubscriptionBodyInfo(response.clone());
+        let bodyInfo = await parseSubscriptionBodyInfo(response.clone());
+
+        // 某些面板默认链接只返回流量头，不返回节点；尝试常见参数变体补全节点信息
+        if (!bodyInfo.nodeCount || bodyInfo.nodeCount <= 0) {
+            bodyInfo = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo);
+        }
 
         if (!userinfo) {
             const bodyText = await response.text();
@@ -318,6 +323,78 @@ async function querySubscription(subUrl) {
     } catch (e) {
         throw new Error(`订阅查询失败: ${e.message}`);
     }
+}
+
+async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo) {
+    try {
+        const variants = buildSubscriptionVariants(subUrl);
+        let best = fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
+
+        for (const candidate of variants) {
+            for (const ua of userAgents) {
+                try {
+                    const res = await fetch(candidate, {
+                        method: "GET",
+                        headers: {
+                            "Accept": "*/*",
+                            "User-Agent": ua
+                        },
+                        redirect: "manual"
+                    });
+
+                    if (!res.ok) continue;
+                    const info = await parseSubscriptionBodyInfo(res.clone());
+                    if ((info.nodeCount || 0) > (best.nodeCount || 0)) {
+                        best = info;
+                    }
+
+                    if ((best.nodeCount || 0) >= 3 && (best.protocolTypes || []).length > 0) {
+                        return best;
+                    }
+                } catch {
+
+                }
+            }
+        }
+
+        return best;
+    } catch {
+        return fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
+    }
+}
+
+function buildSubscriptionVariants(subUrl) {
+    const variants = new Set();
+    variants.add(subUrl);
+
+    try {
+        const url = new URL(subUrl);
+        const appendVariant = (mutator) => {
+            const u = new URL(url.toString());
+            mutator(u.searchParams);
+            variants.add(u.toString());
+        };
+
+        appendVariant((p) => p.set('clash', '3'));
+        appendVariant((p) => p.set('clash', '1'));
+        appendVariant((p) => p.set('target', 'clash'));
+        appendVariant((p) => p.set('target', 'clash-meta'));
+        appendVariant((p) => p.set('target', 'singbox'));
+        appendVariant((p) => p.set('target', 'v2ray'));
+        appendVariant((p) => p.set('extend', '1'));
+        appendVariant((p) => {
+            p.set('clash', '3');
+            p.set('extend', '1');
+        });
+        appendVariant((p) => {
+            p.set('target', 'clash');
+            p.set('list', '1');
+        });
+    } catch {
+
+    }
+
+    return Array.from(variants);
 }
 
 function decodeRFC5987(value) {
