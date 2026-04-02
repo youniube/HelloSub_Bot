@@ -104,7 +104,8 @@ export default {
                 await sendMessage(botToken, update.message.chat.id, `⏳ 已识别 ${subUrls.length} 条链接，正在分批查询并回传结果...`);
                 ctx.waitUntil(processSubscriptionsInBatches(botToken, update.message.chat.id, subUrls, {
                     batchSize: 3,
-                    concurrency: 2
+                    concurrency: 2,
+                    hide403InMulti: subUrls.length > 1
                 }));
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
@@ -699,7 +700,10 @@ function generateProgressBar(percentage) {
     return "[" + "■".repeat(filled) + "□".repeat(totalBlocks - filled) + "]";
 }
 
-async function processSubscriptionsWithLimit(subUrls, concurrency = 2) {
+async function processSubscriptionsWithLimit(subUrls, options = {}) {
+    const concurrency = Math.max(1, Math.min(options.concurrency || 2, 4));
+    const hide403InMulti = !!options.hide403InMulti;
+
     const results = new Array(subUrls.length);
     let index = 0;
 
@@ -715,19 +719,24 @@ async function processSubscriptionsWithLimit(subUrls, concurrency = 2) {
                 const status = evaluateSubscriptionStatus(info);
                 results[current] = {
                     text: formatOutput(subUrl, info),
-                    status
+                    status,
+                    hidden: false
                 };
             } catch (e) {
+                const errMsg = String(e && e.message ? e.message : e);
+                const is403 = /\b403\b/.test(errMsg);
+                const shouldHide = hide403InMulti && is403;
+
                 results[current] = {
-                    text: `订阅链接: ${subUrl}\n查询失败: ${e.message}`,
-                    status: 'failed'
+                    text: shouldHide ? '' : `订阅链接: ${subUrl}\n查询失败: ${errMsg}`,
+                    status: 'failed',
+                    hidden: shouldHide
                 };
             }
         }
     }
 
-    const count = Math.max(1, Math.min(concurrency, 4));
-    await Promise.all(Array.from({ length: count }, () => worker()));
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
     return results;
 }
 
@@ -735,9 +744,10 @@ async function processSubscriptionsWithLimit(subUrls, concurrency = 2) {
 async function processSubscriptionsInBatches(token, chatId, subUrls, options = {}) {
     const batchSize = Math.max(1, Math.min(options.batchSize || 3, 6));
     const concurrency = Math.max(1, Math.min(options.concurrency || 2, 4));
+    const hide403InMulti = !!options.hide403InMulti;
+
     const total = subUrls.length;
     const totalBatches = Math.ceil(total / batchSize);
-
     const summary = { valid: 0, exhausted: 0, expired: 0, failed: 0 };
 
     for (let i = 0; i < totalBatches; i++) {
@@ -746,18 +756,24 @@ async function processSubscriptionsInBatches(token, chatId, subUrls, options = {
         const currentBatch = subUrls.slice(start, end);
 
         try {
-            const outputs = await processSubscriptionsWithLimit(currentBatch, concurrency);
+            const outputs = await processSubscriptionsWithLimit(currentBatch, { concurrency, hide403InMulti });
 
             for (const item of outputs) {
+                if (!item) continue;
                 if (item.status === 'valid') summary.valid += 1;
                 else if (item.status === 'exhausted') summary.exhausted += 1;
                 else if (item.status === 'expired') summary.expired += 1;
                 else summary.failed += 1;
             }
 
-            const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
-            const merged = `${header}\n\n${outputs.map(v => v.text).join("\n\n────────────\n\n")}`;
-            await sendLongMessage(token, chatId, merged);
+            const visibleTexts = outputs.filter(v => v && !v.hidden && v.text).map(v => v.text);
+            if (visibleTexts.length > 0) {
+                const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
+                const merged = `${header}\n\n${visibleTexts.join("\n\n────────────\n\n")}`;
+                await sendLongMessage(token, chatId, merged);
+            } else {
+                await sendMessage(token, chatId, `📦 批次 ${i + 1}/${totalBatches} 已完成（该批均为403等已隐藏失败）`);
+            }
         } catch (e) {
             summary.failed += currentBatch.length;
             await sendMessage(token, chatId, `📦 批次 ${i + 1}/${totalBatches} 处理失败: ${e.message || '未知错误'}`);
