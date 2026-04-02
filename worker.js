@@ -454,7 +454,8 @@ function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl)
                 const decoded = atob(b64);
                 if (decoded && decoded.trim()) return decoded.trim();
             }
-            if (profileTitle.trim()) return profileTitle.trim();
+            const normalized = decodeMaybeUriComponent(profileTitle.trim());
+            if (normalized) return normalized;
         } catch {
 
         }
@@ -470,7 +471,10 @@ function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl)
             }
 
             const m2 = contentDisposition.match(/filename="?([^";]+)"?/i);
-            if (m2 && m2[1] && m2[1].trim()) return m2[1].trim();
+            if (m2 && m2[1] && m2[1].trim()) {
+                const name = decodeMaybeUriComponent(m2[1].trim());
+                if (name) return name;
+            }
         } catch {
 
         }
@@ -496,6 +500,16 @@ function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl)
 
     return '未知';
 }
+
+function decodeMaybeUriComponent(text) {
+    if (!text) return text;
+    try {
+        return decodeURIComponent(text);
+    } catch {
+        return text;
+    }
+}
+
 
 function detectProtocolType(url) {
     if (url.startsWith('ss://')) return 'Shadowsocks';
@@ -551,7 +565,8 @@ async function parseSubscriptionBodyInfo(response) {
 
         for (const line of clashNodeLines) {
             const parsed = parseClashProxyLine(line);
-            if (parsed.type) protocolSet.add(normalizeClashType(parsed.type));
+            const normalizedType = normalizeClashType(parsed.type);
+            if (normalizedType) protocolSet.add(normalizedType);
 
             const region = detectRegionFromName(parsed.name || line);
             if (region) {
@@ -589,8 +604,9 @@ function parseClashProxyLine(line) {
 }
 
 function normalizeClashType(type) {
-    if (!type) return '其他';
+    if (!type) return null;
 
+    const t = String(type).toLowerCase();
     const mapping = {
         ss: 'Shadowsocks',
         ssr: 'ShadowsocksR',
@@ -603,21 +619,37 @@ function normalizeClashType(type) {
         tuic: 'TUIC',
         wireguard: 'WireGuard',
         snell: 'Snell',
-        http: 'HTTP',
-        socks5: 'SOCKS5',
         anytls: 'AnyTLS'
     };
 
-    return mapping[type] || type.toUpperCase();
+    // 过滤分组/策略类型，避免把 SELECT / URL-TEST / FALLBACK 当协议
+    const nonProxyTypes = new Set([
+        'select',
+        'url-test',
+        'fallback',
+        'load-balance',
+        'relay',
+        'direct',
+        'reject'
+    ]);
+    if (nonProxyTypes.has(t)) return null;
+
+    return mapping[t] || t.toUpperCase();
 }
 
+
 const REGION_RULES = [
+    { region: '中国', keywords: ['中国', 'cn', 'china', '上海', '广州', '深圳', '北京'] },
     { region: '香港', keywords: ['香港', 'hk', 'hongkong'] },
-    { region: '日本', keywords: ['日本', 'jp', 'japan', '东京', '大阪'] },
-    { region: '美国', keywords: ['美国', 'us', 'usa', 'united states', '洛杉矶', '硅谷', '西雅图'] },
-    { region: '新加坡', keywords: ['新加坡', 'sg', 'singapore'] },
     { region: '台湾', keywords: ['台湾', 'tw', 'taiwan', '台北'] },
+    { region: '日本', keywords: ['日本', 'jp', 'japan', '东京', '大阪'] },
+    { region: '新加坡', keywords: ['新加坡', 'sg', 'singapore'] },
+    { region: '美国', keywords: ['美国', 'us', 'usa', 'united states', '洛杉矶', '硅谷', '西雅图'] },
     { region: '韩国', keywords: ['韩国', 'kr', 'korea', '首尔'] },
+    { region: '印度', keywords: ['印度', 'in', 'india'] },
+    { region: '印度尼西亚', keywords: ['印度尼西亚', '印尼', 'id', 'indonesia', 'jakarta'] },
+    { region: '马来西亚', keywords: ['马来西亚', 'my', 'malaysia', 'kuala lumpur'] },
+    { region: '泰国', keywords: ['泰国', 'th', 'thailand', 'bangkok'] },
     { region: '英国', keywords: ['英国', 'uk', 'britain', 'london'] },
     { region: '德国', keywords: ['德国', 'de', 'germany', 'frankfurt'] },
     { region: '法国', keywords: ['法国', 'fr', 'france', 'paris'] },
