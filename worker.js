@@ -730,8 +730,13 @@ async function processSubscriptionsInBatches(token, chatId, subUrls, options = {
         const currentBatch = subUrls.slice(start, end);
 
         const outputs = await processSubscriptionsWithLimit(currentBatch, concurrency);
+
+        const done = end;
+        const percent = ((done / total) * 100).toFixed(1);
         const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
-        const merged = `${header}\n\n${outputs.join("\n\n────────────\n\n")}`;
+        const progressLine = `✅ 处理进度: ${done}/${total} (${percent}%)`;
+
+        const merged = `${header}\n${progressLine}\n\n${outputs.join("\n\n────────────\n\n")}`;
         await sendLongMessage(token, chatId, merged);
     }
 }
