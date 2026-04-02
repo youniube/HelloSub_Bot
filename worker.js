@@ -232,6 +232,7 @@ async function querySubscription(subUrl) {
         let contentDisposition = response.headers.get("content-disposition");
 
         let configName = extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl);
+        let resetDays = null;
 
         if (!userinfo) {
             const bodyText = await response.text();
@@ -262,7 +263,7 @@ async function querySubscription(subUrl) {
                         total: totalGB * (1024 ** 3),
                         expire,
                         configName,
-                        resetDays: updateInterval ? parseInt(updateInterval, 10) : 0
+                        resetDays: Number.isFinite(resetDays) ? resetDays : null
                     };
                 } else {
                     throw new Error("该订阅没有设置流量信息");
@@ -282,7 +283,7 @@ async function querySubscription(subUrl) {
         const download = params.get("download") || 0;
         const total = params.get("total") || 0;
         const expire = params.get("expire") || 0;
-        const resetDays = updateInterval ? parseInt(updateInterval, 10) : 0;
+        resetDays = updateInterval ? parseInt(updateInterval, 10) : null;
 
         return { upload, download, total, expire, configName, resetDays };
     } catch (e) {
@@ -352,7 +353,7 @@ function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl)
 
 function formatOutput(subUrl, info) {
     const used = info.upload + info.download;
-    const remaining = info.total - used;
+    const remaining = Math.max(info.total - used, 0);
     const progress = (used / info.total) * 100 || 0;
     const progressBar = generateProgressBar(progress);
 
@@ -360,17 +361,26 @@ function formatOutput(subUrl, info) {
     const totalGB = (info.total / (1024 ** 3)).toFixed(2);
     const remainingGB = (remaining / (1024 ** 3)).toFixed(2);
 
-    const expireDate = new Date(info.expire * 1000).toISOString().replace("T", " ").replace(/\..+/, "");
+    const expireDateObj = new Date(info.expire * 1000);
+    const expireDate = expireDateObj.toLocaleString("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        hour12: false
+    }).replace(/\//g, "-");
 
     const now = Date.now();
     const diffMs = info.expire * 1000 - now;
-    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    const hours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-    const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-    const seconds = Math.floor((diffMs % (1000 * 60)) / 1000);
+    const safeDiff = Math.max(diffMs, 0);
+    const days = Math.floor(safeDiff / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((safeDiff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    const minutes = Math.floor((safeDiff % (1000 * 60 * 60)) / (1000 * 60));
+    const seconds = Math.floor((safeDiff % (1000 * 60)) / 1000);
     const remainingTime = `${days}天${hours}时${minutes}分${seconds}秒`;
 
-    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n流量重置: ${info.resetDays}日\n过期时间: ${expireDate}\n剩余时间: ${remainingTime}`;
+    const resetLine = Number.isFinite(info.resetDays)
+        ? `流量重置: ${info.resetDays}小时\n`
+        : "";
+
+    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${resetLine}过期时间: ${expireDate}\n剩余时间: ${remainingTime}`;
 }
 
 function generateProgressBar(percentage) {
