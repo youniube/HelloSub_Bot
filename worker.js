@@ -406,21 +406,37 @@ async function parseSubscriptionBodyInfo(response) {
         }
 
         const lines = decoded.split(/\r?\n/).map(v => v.trim()).filter(Boolean);
-        const nodeLines = lines.filter(line => /^[a-z][a-z0-9+.-]*:\/\//i.test(line) && !line.toLowerCase().startsWith('status='));
 
-        const nodeCount = nodeLines.length;
+        // 同时支持两类订阅：
+        // 1) URI 行：ss:// / trojan:// / vless:// ...
+        // 2) Clash YAML 行：- {name: "xx", type: ss, ...}
+        const uriNodeLines = lines.filter(line => /^[a-z][a-z0-9+.-]*:\/\//i.test(line) && !line.toLowerCase().startsWith('status='));
+        const clashNodeLines = lines.filter(line => /^-\s*\{.*\bname\s*:\s*.+\btype\s*:\s*.+\}$/i.test(line));
+        const nodeCount = uriNodeLines.length + clashNodeLines.length;
+
         if (nodeCount === 0) return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
 
         const protocolSet = new Set();
         const regionSet = new Set();
         const regionStats = {};
 
-        for (const line of nodeLines) {
+        for (const line of uriNodeLines) {
             const protocol = detectProtocolType(line);
             if (protocol) protocolSet.add(protocol);
 
             const nodeName = extractNodeNameFromLine(line);
             const region = detectRegionFromName(nodeName || line);
+            if (region) {
+                regionSet.add(region);
+                regionStats[region] = (regionStats[region] || 0) + 1;
+            }
+        }
+
+        for (const line of clashNodeLines) {
+            const parsed = parseClashProxyLine(line);
+            if (parsed.type) protocolSet.add(normalizeClashType(parsed.type));
+
+            const region = detectRegionFromName(parsed.name || line);
             if (region) {
                 regionSet.add(region);
                 regionStats[region] = (regionStats[region] || 0) + 1;
@@ -438,24 +454,44 @@ async function parseSubscriptionBodyInfo(response) {
     }
 }
 
-function extractNodeNameFromLine(line) {
+function parseClashProxyLine(line) {
     try {
-        const hashIndex = line.indexOf('#');
-        if (hashIndex > -1) {
-            const hashName = decodeURIComponent(line.slice(hashIndex + 1).replace(/\+/g, ' ')).trim();
-            if (hashName) return hashName;
-        }
+        const nameMatch = line.match(/\bname\s*:\s*(?:"([^"]+)"|'([^']+)'|([^,}]+))/i);
+        const typeMatch = line.match(/\btype\s*:\s*(?:"([^"]+)"|'([^']+)'|([^,}]+))/i);
 
-        if (line.startsWith('vmess://')) {
-            const payload = line.slice(8).trim();
-            const parsed = JSON.parse(atob(payload));
-            if (parsed && parsed.ps) return String(parsed.ps).trim();
-        }
+        const rawName = (nameMatch?.[1] || nameMatch?.[2] || nameMatch?.[3] || '').trim();
+        const rawType = (typeMatch?.[1] || typeMatch?.[2] || typeMatch?.[3] || '').trim();
+
+        return {
+            name: rawName,
+            type: rawType.toLowerCase()
+        };
     } catch {
-
+        return { name: '', type: '' };
     }
+}
 
-    return '';
+function normalizeClashType(type) {
+    if (!type) return '其他';
+
+    const mapping = {
+        ss: 'Shadowsocks',
+        ssr: 'ShadowsocksR',
+        vmess: 'VMess',
+        vless: 'VLESS',
+        trojan: 'Trojan',
+        hysteria2: 'Hysteria2',
+        hy2: 'Hysteria2',
+        hysteria: 'Hysteria',
+        tuic: 'TUIC',
+        wireguard: 'WireGuard',
+        snell: 'Snell',
+        http: 'HTTP',
+        socks5: 'SOCKS5',
+        anytls: 'AnyTLS'
+    };
+
+    return mapping[type] || type.toUpperCase();
 }
 
 const REGION_RULES = [
