@@ -1,4 +1,4 @@
-name = "HelloSub_Bot"
+name = "dycx-2"
 main = "worker.js"
 compatibility_date = "2025-07-28"
 usage_model = "bundled"
