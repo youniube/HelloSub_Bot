@@ -278,8 +278,10 @@ async function querySubscription(subUrl) {
                         expire,
                         configName,
                         resetDays: Number.isFinite(resetDays) ? resetDays : null,
-                        protocolType: bodyInfo.protocolType || "未知",
-                        nodeCount: bodyInfo.nodeCount || 0
+                        protocolTypes: bodyInfo.protocolTypes || [],
+                        nodeCount: bodyInfo.nodeCount || 0,
+                        regions: bodyInfo.regions || [],
+                        regionStats: bodyInfo.regionStats || {}
                     };
                 } else {
                     throw new Error("该订阅没有设置流量信息");
@@ -308,8 +310,10 @@ async function querySubscription(subUrl) {
             expire,
             configName,
             resetDays: Number.isFinite(resetDays) ? resetDays : null,
-            protocolType: bodyInfo.protocolType || "未知",
-            nodeCount: bodyInfo.nodeCount || 0
+            protocolTypes: bodyInfo.protocolTypes || [],
+            nodeCount: bodyInfo.nodeCount || 0,
+            regions: bodyInfo.regions || [],
+            regionStats: bodyInfo.regionStats || {}
         };
     } catch (e) {
         throw new Error(`订阅查询失败: ${e.message}`);
@@ -392,7 +396,7 @@ function detectProtocolType(url) {
 async function parseSubscriptionBodyInfo(response) {
     try {
         const bodyText = await response.text();
-        if (!bodyText) return { protocolType: null, nodeCount: 0 };
+        if (!bodyText) return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
 
         let decoded = bodyText;
         try {
@@ -405,33 +409,96 @@ async function parseSubscriptionBodyInfo(response) {
         const nodeLines = lines.filter(line => /^[a-z][a-z0-9+.-]*:\/\//i.test(line) && !line.toLowerCase().startsWith('status='));
 
         const nodeCount = nodeLines.length;
-        if (nodeCount === 0) return { protocolType: null, nodeCount: 0 };
+        if (nodeCount === 0) return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
 
-        const protocolCounter = new Map();
+        const protocolSet = new Set();
+        const regionSet = new Set();
+        const regionStats = {};
+
         for (const line of nodeLines) {
-            const p = detectProtocolType(line) || '其他';
-            protocolCounter.set(p, (protocolCounter.get(p) || 0) + 1);
-        }
+            const protocol = detectProtocolType(line);
+            if (protocol) protocolSet.add(protocol);
 
-        let protocolType = '未知';
-        let maxCount = -1;
-        for (const [k, v] of protocolCounter.entries()) {
-            if (v > maxCount) {
-                maxCount = v;
-                protocolType = k;
+            const nodeName = extractNodeNameFromLine(line);
+            const region = detectRegionFromName(nodeName || line);
+            if (region) {
+                regionSet.add(region);
+                regionStats[region] = (regionStats[region] || 0) + 1;
             }
         }
 
-        return { protocolType, nodeCount };
+        return {
+            protocolTypes: Array.from(protocolSet),
+            nodeCount,
+            regions: sortRegions(Array.from(regionSet)),
+            regionStats
+        };
     } catch {
-        return { protocolType: null, nodeCount: 0 };
+        return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
     }
+}
+
+function extractNodeNameFromLine(line) {
+    try {
+        const hashIndex = line.indexOf('#');
+        if (hashIndex > -1) {
+            const hashName = decodeURIComponent(line.slice(hashIndex + 1).replace(/\+/g, ' ')).trim();
+            if (hashName) return hashName;
+        }
+
+        if (line.startsWith('vmess://')) {
+            const payload = line.slice(8).trim();
+            const parsed = JSON.parse(atob(payload));
+            if (parsed && parsed.ps) return String(parsed.ps).trim();
+        }
+    } catch {
+
+    }
+
+    return '';
+}
+
+const REGION_RULES = [
+    { region: '香港', keywords: ['香港', 'hk', 'hongkong'] },
+    { region: '日本', keywords: ['日本', 'jp', 'japan', '东京', '大阪'] },
+    { region: '美国', keywords: ['美国', 'us', 'usa', 'united states', '洛杉矶', '硅谷', '西雅图'] },
+    { region: '新加坡', keywords: ['新加坡', 'sg', 'singapore'] },
+    { region: '台湾', keywords: ['台湾', 'tw', 'taiwan', '台北'] },
+    { region: '韩国', keywords: ['韩国', 'kr', 'korea', '首尔'] },
+    { region: '英国', keywords: ['英国', 'uk', 'britain', 'london'] },
+    { region: '德国', keywords: ['德国', 'de', 'germany', 'frankfurt'] },
+    { region: '法国', keywords: ['法国', 'fr', 'france', 'paris'] },
+    { region: '加拿大', keywords: ['加拿大', 'ca', 'canada', 'toronto', 'vancouver'] },
+    { region: '澳大利亚', keywords: ['澳大利亚', 'au', 'australia', 'sydney', 'melbourne'] }
+];
+
+function detectRegionFromName(name) {
+    if (!name) return null;
+    const lower = name.toLowerCase();
+    for (const rule of REGION_RULES) {
+        if (rule.keywords.some(keyword => lower.includes(keyword))) {
+            return rule.region;
+        }
+    }
+    return null;
+}
+
+function sortRegions(regions) {
+    const order = REGION_RULES.map(rule => rule.region);
+    const orderMap = new Map(order.map((name, idx) => [name, idx]));
+
+    return [...regions].sort((a, b) => {
+        const ia = orderMap.has(a) ? orderMap.get(a) : Number.MAX_SAFE_INTEGER;
+        const ib = orderMap.has(b) ? orderMap.get(b) : Number.MAX_SAFE_INTEGER;
+        if (ia !== ib) return ia - ib;
+        return a.localeCompare(b, 'zh-CN');
+    });
 }
 
 function formatOutput(subUrl, info) {
     const used = info.upload + info.download;
     const remaining = Math.max(info.total - used, 0);
-    const progress = (used / info.total) * 100 || 0;
+    const progress = info.total > 0 ? (used / info.total) * 100 : 0;
     const progressBar = generateProgressBar(progress);
 
     const usedGB = (used / (1024 ** 3)).toFixed(2);
@@ -439,10 +506,9 @@ function formatOutput(subUrl, info) {
     const remainingGB = (remaining / (1024 ** 3)).toFixed(2);
 
     const expireDateObj = new Date(info.expire * 1000);
-    const expireDate = expireDateObj.toLocaleString("zh-CN", {
-        timeZone: "Asia/Shanghai",
-        hour12: false
-    });
+    const expireDate = info.expire > 0
+        ? expireDateObj.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })
+        : "未提供";
 
     const now = Date.now();
     const diffMs = info.expire * 1000 - now;
@@ -451,26 +517,38 @@ function formatOutput(subUrl, info) {
     const hours = Math.floor((safeDiff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
     const minutes = Math.floor((safeDiff % (1000 * 60 * 60)) / (1000 * 60));
     const seconds = Math.floor((safeDiff % (1000 * 60)) / 1000);
-    const remainingTime = `${days}天${hours}时${minutes}分${seconds}秒`;
+    const remainingTime = info.expire > 0 ? `${days}天${hours}时${minutes}分${seconds}秒` : "未知";
 
-    const resetLine = Number.isFinite(info.resetDays)
-        ? `流量重置: ${info.resetDays}小时\n`
-        : "";
+    const protocolText = info.protocolTypes && info.protocolTypes.length > 0
+        ? info.protocolTypes.join(', ')
+        : '未知';
 
-    const protocolLine = info.protocolType && info.protocolType !== "未知"
-        ? `协议类型: ${info.protocolType}\n`
-        : "";
+    const sortedRegions = info.regions && info.regions.length > 0 ? sortRegions(info.regions) : [];
+    const regionCount = sortedRegions.length;
+    const nodeLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0
+        ? `节点总数: ${info.nodeCount} | 国家/地区: ${regionCount}\n`
+        : '';
 
-    const nodeCountLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0
-        ? `节点总数: ${info.nodeCount}\n`
-        : "";
+    const coverageLine = regionCount > 0
+        ? `覆盖范围: ${sortedRegions.join('、')}\n`
+        : '';
 
-    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${protocolLine}${nodeCountLine}${resetLine}过期时间: ${expireDate} (剩余${days}天)\n剩余时间: ${remainingTime}`;
+    const regionStats = info.regionStats || {};
+    const regionDistribution = sortedRegions
+        .map(region => `${region} ${regionStats[region] || 0}`)
+        .join('｜');
+    const regionDistributionLine = regionDistribution
+        ? `地区分布: ${regionDistribution}\n`
+        : '';
+
+    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n协议类型: ${protocolText}\n${nodeLine}${coverageLine}${regionDistributionLine}过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ''}\n剩余时间: ${remainingTime}`;
 }
 
 function generateProgressBar(percentage) {
-    const filled = Math.round(percentage / 10);
-    return "[" + "■".repeat(filled) + "□".repeat(11 - filled) + "]";
+    const normalized = Math.min(Math.max(percentage, 0), 100);
+    const totalBlocks = 11;
+    const filled = Math.round((normalized / 100) * totalBlocks);
+    return "[" + "■".repeat(filled) + "□".repeat(totalBlocks - filled) + "]";
 }
 
 async function sendMessage(token, chatId, text, parseMode = null) {
