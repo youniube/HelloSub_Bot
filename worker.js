@@ -253,6 +253,11 @@ async function querySubscription(subUrl) {
             bodyInfo = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo);
         }
 
+        // 若节点信息来自变体链接，且变体有更准确的配置名，则覆盖默认名称
+        if (bodyInfo && bodyInfo.configNameHint && bodyInfo.configNameHint !== '未知') {
+            configName = bodyInfo.configNameHint;
+        }
+
         if (!userinfo) {
             const bodyText = await response.text();
             let decodedBody = bodyText;
@@ -344,8 +349,20 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo) {
 
                     if (!res.ok) continue;
                     const info = await parseSubscriptionBodyInfo(res.clone());
-                    if ((info.nodeCount || 0) > (best.nodeCount || 0)) {
-                        best = info;
+                    const candidateConfigName = extractConfigName(
+                        res.headers.get("profile-title"),
+                        res.headers.get("content-disposition"),
+                        res.headers.get("profile-web-page-url"),
+                        candidate
+                    );
+                    const enrichedInfo = {
+                        ...info,
+                        sourceUrl: candidate,
+                        configNameHint: candidateConfigName
+                    };
+
+                    if ((enrichedInfo.nodeCount || 0) > (best.nodeCount || 0)) {
+                        best = enrichedInfo;
                     }
 
                     if ((best.nodeCount || 0) >= 3 && (best.protocolTypes || []).length > 0) {
