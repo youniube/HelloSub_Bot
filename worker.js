@@ -174,23 +174,64 @@ function isValidUrl(url) {
 }
 
 async function querySubscription(subUrl) {
-    try {
-        const response = await fetch(subUrl, {
-            method: "GET",
-            headers: {
-                "Accept": "*/*",
-                "User-Agent": "Shadowrocket/2701 CFNetwork/3857.100.1 Darwin/25.0.0 iPhone14,4"
-            },
-            redirect: "manual"
-        });
+    const userAgents = [
+        "clash-meta",
+        "Clash",
+        "Clash Verge/1.7",
+        "Stash/1.0",
+        "sing-box 1.9",
+        "Shadowrocket/2701 CFNetwork/3857.100.1 Darwin/25.0.0 iPhone14,4",
+        "Quantumult X"
+    ];
 
-        if (!response.ok) {
-            throw new Error(`请求失败，状态码: ${response.status}。解决方案: 确认链接可访问，无重定向问题。`);
+    try {
+        let response = null;
+        let lastError = null;
+
+        // 逐个 UA 尝试，优先拿到带订阅头信息的响应
+        for (const ua of userAgents) {
+            try {
+                const res = await fetch(subUrl, {
+                    method: "GET",
+                    headers: {
+                        "Accept": "*/*",
+                        "User-Agent": ua
+                    },
+                    redirect: "manual"
+                });
+
+                if (!res.ok) {
+                    lastError = new Error(`请求失败，状态码: ${res.status}`);
+                    continue;
+                }
+
+                const hasUserInfo = !!res.headers.get("Subscription-Userinfo");
+                const hasNameHints = !!res.headers.get("profile-title") || !!res.headers.get("content-disposition") || !!res.headers.get("profile-web-page-url");
+
+                // 命中关键头信息就立即使用
+                if (hasUserInfo || hasNameHints) {
+                    response = res;
+                    break;
+                }
+
+                // 暂存一个可用响应兜底
+                if (!response) response = res;
+            } catch (e) {
+                lastError = e;
+            }
+        }
+
+        if (!response) {
+            throw new Error(`请求失败。${lastError ? `原因: ${lastError.message}` : ""}`);
         }
 
         let userinfo = response.headers.get("Subscription-Userinfo");
         let updateInterval = response.headers.get("profile-update-interval");
         let webPageUrl = response.headers.get("profile-web-page-url");
+        let profileTitle = response.headers.get("profile-title");
+        let contentDisposition = response.headers.get("content-disposition");
+
+        let configName = extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl);
 
         if (!userinfo) {
             const bodyText = await response.text();
@@ -220,8 +261,8 @@ async function querySubscription(subUrl) {
                         download: downloadGB * (1024 ** 3),
                         total: totalGB * (1024 ** 3),
                         expire,
-                        configName: "未知",
-                        resetDays: 0
+                        configName,
+                        resetDays: updateInterval ? parseInt(updateInterval, 10) : 0
                     };
                 } else {
                     throw new Error("该订阅没有设置流量信息");
@@ -241,23 +282,72 @@ async function querySubscription(subUrl) {
         const download = params.get("download") || 0;
         const total = params.get("total") || 0;
         const expire = params.get("expire") || 0;
-
-        let configName = "未知";
-        if (webPageUrl) {
-            try {
-                const domain = new URL(webPageUrl).hostname.split(".")[0];
-                configName = domain.charAt(0).toUpperCase() + domain.slice(1);
-            } catch {
-                configName = "未知 (网页 URL 解析失败)";
-            }
-        }
-
         const resetDays = updateInterval ? parseInt(updateInterval, 10) : 0;
 
         return { upload, download, total, expire, configName, resetDays };
     } catch (e) {
         throw new Error(`订阅查询失败: ${e.message}`);
     }
+}
+
+function decodeRFC5987(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl) {
+    // 1) profile-title: base64:xxxx
+    if (profileTitle) {
+        try {
+            if (profileTitle.toLowerCase().startsWith('base64:')) {
+                const b64 = profileTitle.slice(7);
+                const decoded = atob(b64);
+                if (decoded && decoded.trim()) return decoded.trim();
+            }
+            if (profileTitle.trim()) return profileTitle.trim();
+        } catch {
+
+        }
+    }
+
+    // 2) content-disposition: attachment;filename*=UTF-8''...
+    if (contentDisposition) {
+        try {
+            const m1 = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+            if (m1 && m1[1]) {
+                const name = decodeRFC5987(m1[1]).trim();
+                if (name) return name;
+            }
+
+            const m2 = contentDisposition.match(/filename="?([^";]+)"?/i);
+            if (m2 && m2[1] && m2[1].trim()) return m2[1].trim();
+        } catch {
+
+        }
+    }
+
+    // 3) profile-web-page-url 的二级域名
+    if (webPageUrl) {
+        try {
+            const domain = new URL(webPageUrl).hostname.split('.')[0];
+            if (domain) return domain.charAt(0).toUpperCase() + domain.slice(1);
+        } catch {
+
+        }
+    }
+
+    // 4) 订阅链接主域名兜底
+    try {
+        const host = new URL(subUrl).hostname.split('.')[0];
+        if (host) return host.charAt(0).toUpperCase() + host.slice(1);
+    } catch {
+
+    }
+
+    return '未知';
 }
 
 function formatOutput(subUrl, info) {
