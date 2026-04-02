@@ -95,15 +95,24 @@ export default {
                     return new Response('OK');
                 }
                 
-                const subUrl = extractUrlFromText(messageText);
-                if (!subUrl) {
+                const subUrls = extractUrlsFromText(messageText);
+                if (subUrls.length === 0) {
                     await sendMessage(botToken, update.message.chat.id, "❌ 未识别到有效订阅链接，请直接发送链接或包含链接的文本！");
                     return new Response('OK');
                 }
-                
-                const info = await querySubscription(subUrl);
-                const output = formatOutput(subUrl, info);
-                await sendMessage(botToken, update.message.chat.id, escapeMarkdown(output), 'MarkdownV2');
+
+                const outputs = [];
+                for (const subUrl of subUrls) {
+                    try {
+                        const info = await querySubscription(subUrl);
+                        outputs.push(formatOutput(subUrl, info));
+                    } catch (e) {
+                        outputs.push(`订阅链接: ${subUrl}\n查询失败: ${e.message}`);
+                    }
+                }
+
+                const merged = outputs.join("\n\n────────────\n\n");
+                await sendLongMessage(botToken, update.message.chat.id, merged);
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
                 const userId = update.inline_query.from.id;
@@ -165,16 +174,26 @@ function escapeMarkdown(text) {
     return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
 }
 
-function extractUrlFromText(text) {
-    if (!text) return null;
+function extractUrlsFromText(text) {
+    if (!text) return [];
     const matches = text.match(/https?:\/\/[^\s"'<>，。；、））]+/gi);
-    if (!matches) return null;
+    if (!matches) return [];
 
+    const urls = [];
+    const seen = new Set();
     for (const raw of matches) {
         const candidate = raw.replace(/[),.，。；;!！]+$/g, '');
-        if (isValidUrl(candidate)) return candidate;
+        if (isValidUrl(candidate) && !seen.has(candidate)) {
+            seen.add(candidate);
+            urls.push(candidate);
+        }
     }
-    return null;
+    return urls;
+}
+
+function extractUrlFromText(text) {
+    const urls = extractUrlsFromText(text);
+    return urls.length > 0 ? urls[0] : null;
 }
 
 function isValidUrl(url) {
@@ -679,6 +698,26 @@ function generateProgressBar(percentage) {
     const totalBlocks = 11;
     const filled = Math.round((normalized / 100) * totalBlocks);
     return "[" + "■".repeat(filled) + "□".repeat(totalBlocks - filled) + "]";
+}
+
+async function sendLongMessage(token, chatId, text) {
+    const maxLen = 3500; // 给 Telegram 留安全余量
+    if (!text || text.length <= maxLen) {
+        await sendMessage(token, chatId, escapeMarkdown(text || ''), 'MarkdownV2');
+        return;
+    }
+
+    let start = 0;
+    while (start < text.length) {
+        let end = Math.min(start + maxLen, text.length);
+        if (end < text.length) {
+            const lastBreak = text.lastIndexOf('\n', end);
+            if (lastBreak > start + 200) end = lastBreak;
+        }
+        const chunk = text.slice(start, end);
+        await sendMessage(token, chatId, escapeMarkdown(chunk), 'MarkdownV2');
+        start = end;
+    }
 }
 
 async function sendMessage(token, chatId, text, parseMode = null) {
