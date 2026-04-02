@@ -101,11 +101,11 @@ export default {
                     return new Response('OK');
                 }
 
-                await sendMessage(botToken, update.message.chat.id, `⏳ 已识别 ${subUrls.length} 条链接，正在分批查询并回传结果...`);
-                ctx.waitUntil(processSubscriptionsInBatches(botToken, update.message.chat.id, subUrls, {
-                    batchSize: 3,
-                    concurrency: 2,
-                    hide403InMulti: subUrls.length > 1
+                await sendMessage(botToken, update.message.chat.id, `⏳ 已识别 ${subUrls.length} 条链接，正在汇总查询结果...`);
+                ctx.waitUntil(processSubscriptionsCombined(botToken, update.message.chat.id, subUrls, {
+                    concurrency: 4,
+                    hide403InMulti: subUrls.length > 1,
+                    fastMode: subUrls.length >= 6
                 }));
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
@@ -209,12 +209,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
     }
 }
 
-async function querySubscription(subUrl) {
-    const userAgents = [
-        "clash-meta",
-        "Clash",
-        "sing-box 1.9"
-    ];
+async function querySubscription(subUrl, options = {}) {
+    const fastMode = !!options.fastMode;
+    const userAgents = fastMode
+        ? ["clash-meta"]
+        : ["clash-meta", "Clash", "sing-box 1.9"];
 
     try {
         let response = null;
@@ -269,7 +268,7 @@ async function querySubscription(subUrl) {
 
         // 某些面板默认链接只返回流量头，不返回节点；尝试常见参数变体补全节点信息
         if (!bodyInfo.nodeCount || bodyInfo.nodeCount <= 0) {
-            bodyInfo = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo);
+            bodyInfo = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo, { fastMode });
         }
 
         // 若节点信息来自变体链接，且变体有更准确的配置名，则覆盖默认名称
@@ -349,9 +348,10 @@ async function querySubscription(subUrl) {
     }
 }
 
-async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo) {
+async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, options = {}) {
     try {
-        const variants = buildSubscriptionVariants(subUrl);
+        const fastMode = !!options.fastMode;
+        const variants = buildSubscriptionVariants(subUrl, { fastMode });
         let best = fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
 
         for (const candidate of variants) {
@@ -399,7 +399,8 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo) {
     }
 }
 
-function buildSubscriptionVariants(subUrl) {
+function buildSubscriptionVariants(subUrl, options = {}) {
+    const fastMode = !!options.fastMode;
     const variants = new Set();
     variants.add(subUrl);
 
@@ -411,21 +412,24 @@ function buildSubscriptionVariants(subUrl) {
             variants.add(u.toString());
         };
 
-        appendVariant((p) => p.set('clash', '3'));
-        appendVariant((p) => p.set('clash', '1'));
-        appendVariant((p) => p.set('target', 'clash'));
-        appendVariant((p) => p.set('target', 'clash-meta'));
-        appendVariant((p) => p.set('target', 'singbox'));
-        appendVariant((p) => p.set('target', 'v2ray'));
-        appendVariant((p) => p.set('extend', '1'));
+        // 高命中优先
         appendVariant((p) => {
             p.set('clash', '3');
             p.set('extend', '1');
         });
+        appendVariant((p) => p.set('target', 'clash'));
         appendVariant((p) => {
             p.set('target', 'clash');
             p.set('list', '1');
         });
+
+        if (!fastMode) {
+            appendVariant((p) => p.set('clash', '1'));
+            appendVariant((p) => p.set('target', 'clash-meta'));
+            appendVariant((p) => p.set('target', 'singbox'));
+            appendVariant((p) => p.set('target', 'v2ray'));
+            appendVariant((p) => p.set('extend', '1'));
+        }
     } catch {
 
     }
@@ -701,7 +705,7 @@ function generateProgressBar(percentage) {
 }
 
 async function processSubscriptionsWithLimit(subUrls, options = {}) {
-    const concurrency = Math.max(1, Math.min(options.concurrency || 2, 4));
+    const concurrency = Math.max(1, Math.min(options.concurrency || 2, 6));
     const hide403InMulti = !!options.hide403InMulti;
 
     const results = new Array(subUrls.length);
@@ -715,7 +719,7 @@ async function processSubscriptionsWithLimit(subUrls, options = {}) {
 
             const subUrl = subUrls[current];
             try {
-                const info = await querySubscription(subUrl);
+                const info = await querySubscription(subUrl, { fastMode: !!options.fastMode });
                 const status = evaluateSubscriptionStatus(info);
                 results[current] = {
                     text: formatOutput(subUrl, info),
@@ -741,51 +745,32 @@ async function processSubscriptionsWithLimit(subUrls, options = {}) {
 }
 
 
-async function processSubscriptionsInBatches(token, chatId, subUrls, options = {}) {
-    const batchSize = Math.max(1, Math.min(options.batchSize || 3, 6));
-    const concurrency = Math.max(1, Math.min(options.concurrency || 2, 4));
+async function processSubscriptionsCombined(token, chatId, subUrls, options = {}) {
+    const concurrency = Math.max(1, Math.min(options.concurrency || 4, 6));
     const hide403InMulti = !!options.hide403InMulti;
+    const fastMode = !!options.fastMode;
 
     const total = subUrls.length;
-    const totalBatches = Math.ceil(total / batchSize);
     const summary = { valid: 0, exhausted: 0, expired: 0, failed: 0 };
 
-    for (let i = 0; i < totalBatches; i++) {
-        const start = i * batchSize;
-        const end = Math.min(start + batchSize, total);
-        const currentBatch = subUrls.slice(start, end);
+    const outputs = await processSubscriptionsWithLimit(subUrls, { concurrency, hide403InMulti, fastMode });
 
-        try {
-            const outputs = await processSubscriptionsWithLimit(currentBatch, { concurrency, hide403InMulti });
+    for (const item of outputs) {
+        if (!item) continue;
+        if (item.status === 'valid') summary.valid += 1;
+        else if (item.status === 'exhausted') summary.exhausted += 1;
+        else if (item.status === 'expired') summary.expired += 1;
+        else summary.failed += 1;
+    }
 
-            for (const item of outputs) {
-                if (!item) continue;
-                if (item.status === 'valid') summary.valid += 1;
-                else if (item.status === 'exhausted') summary.exhausted += 1;
-                else if (item.status === 'expired') summary.expired += 1;
-                else summary.failed += 1;
-            }
-
-            const visibleTexts = outputs.filter(v => v && !v.hidden && v.text).map(v => v.text);
-            if (visibleTexts.length > 0) {
-                const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
-                const merged = `${header}\n\n${visibleTexts.join("\n\n────────────\n\n")}`;
-                await sendLongMessage(token, chatId, merged);
-            } else {
-                await sendMessage(token, chatId, `📦 批次 ${i + 1}/${totalBatches} 已完成（该批均为403等已隐藏失败）`);
-            }
-        } catch (e) {
-            summary.failed += currentBatch.length;
-            await sendMessage(token, chatId, `📦 批次 ${i + 1}/${totalBatches} 处理失败: ${e.message || '未知错误'}`);
-        }
-
-        if (i < totalBatches - 1) {
-            await waitMs(900);
-        }
+    const visibleTexts = outputs.filter(v => v && !v.hidden && v.text).map(v => v.text);
+    if (visibleTexts.length > 0) {
+        const merged = visibleTexts.join("\n\n────────────\n\n");
+        await sendLongMessage(token, chatId, merged);
     }
 
     await sendMessage(token, chatId, `📊 有效: ${summary.valid} | 耗尽: ${summary.exhausted} | 过期: ${summary.expired} | 失败: ${summary.failed}`);
-    await sendMessage(token, chatId, `✅ 全部批次处理完成，共 ${total} 条。`);
+    await sendMessage(token, chatId, `✅ 查询完成，共 ${total} 条。`);
 }
 
 function evaluateSubscriptionStatus(info) {
