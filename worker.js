@@ -95,18 +95,19 @@ export default {
                     return new Response('OK');
                 }
                 
-                if (!isValidUrl(messageText)) {
-                    await sendMessage(botToken, update.message.chat.id, "❌ 请发送有效的订阅链接！");
+                const subUrl = extractUrlFromText(messageText);
+                if (!subUrl) {
+                    await sendMessage(botToken, update.message.chat.id, "❌ 未识别到有效订阅链接，请直接发送链接或包含链接的文本！");
                     return new Response('OK');
                 }
                 
-                const info = await querySubscription(messageText);
-                const output = formatOutput(messageText, info);
+                const info = await querySubscription(subUrl);
+                const output = formatOutput(subUrl, info);
                 await sendMessage(botToken, update.message.chat.id, escapeMarkdown(output), 'MarkdownV2');
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
                 const userId = update.inline_query.from.id;
-                const subUrl = update.inline_query.query.trim();
+                const subUrl = extractUrlFromText(update.inline_query.query.trim());
                 
                 // 检查权限（内联查询）
                 const isPublic = await isPublicMode(env);
@@ -123,7 +124,7 @@ export default {
                     return new Response('OK');
                 }
                 
-                if (!isValidUrl(subUrl)) {
+                if (!subUrl) {
                     await answerInlineQuery(botToken, update.inline_query.id, []);
                     return new Response('OK');
                 }
@@ -162,6 +163,18 @@ export default {
 
 function escapeMarkdown(text) {
     return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
+
+function extractUrlFromText(text) {
+    if (!text) return null;
+    const matches = text.match(/https?:\/\/[^\s"'<>，。；、））]+/gi);
+    if (!matches) return null;
+
+    for (const raw of matches) {
+        const candidate = raw.replace(/[),.，。；;!！]+$/g, '');
+        if (isValidUrl(candidate)) return candidate;
+    }
+    return null;
 }
 
 function isValidUrl(url) {
@@ -233,6 +246,7 @@ async function querySubscription(subUrl) {
 
         let configName = extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl);
         let resetDays = null;
+        const bodyInfo = await parseSubscriptionBodyInfo(response.clone());
 
         if (!userinfo) {
             const bodyText = await response.text();
@@ -263,7 +277,9 @@ async function querySubscription(subUrl) {
                         total: totalGB * (1024 ** 3),
                         expire,
                         configName,
-                        resetDays: Number.isFinite(resetDays) ? resetDays : null
+                        resetDays: Number.isFinite(resetDays) ? resetDays : null,
+                        protocolType: bodyInfo.protocolType || "未知",
+                        nodeCount: bodyInfo.nodeCount || 0
                     };
                 } else {
                     throw new Error("该订阅没有设置流量信息");
@@ -285,7 +301,16 @@ async function querySubscription(subUrl) {
         const expire = params.get("expire") || 0;
         resetDays = updateInterval ? parseInt(updateInterval, 10) : null;
 
-        return { upload, download, total, expire, configName, resetDays };
+        return {
+            upload,
+            download,
+            total,
+            expire,
+            configName,
+            resetDays: Number.isFinite(resetDays) ? resetDays : null,
+            protocolType: bodyInfo.protocolType || "未知",
+            nodeCount: bodyInfo.nodeCount || 0
+        };
     } catch (e) {
         throw new Error(`订阅查询失败: ${e.message}`);
     }
@@ -351,6 +376,58 @@ function extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl)
     return '未知';
 }
 
+function detectProtocolType(url) {
+    if (url.startsWith('ss://')) return 'Shadowsocks';
+    if (url.startsWith('vmess://')) return 'VMess';
+    if (url.startsWith('vless://')) return 'VLESS';
+    if (url.startsWith('trojan://')) return 'Trojan';
+    if (url.startsWith('hysteria2://') || url.startsWith('hy2://')) return 'Hysteria2';
+    if (url.startsWith('hysteria://')) return 'Hysteria';
+    if (url.startsWith('tuic://')) return 'TUIC';
+    if (url.startsWith('wireguard://')) return 'WireGuard';
+    if (url.startsWith('snell://')) return 'Snell';
+    return null;
+}
+
+async function parseSubscriptionBodyInfo(response) {
+    try {
+        const bodyText = await response.text();
+        if (!bodyText) return { protocolType: null, nodeCount: 0 };
+
+        let decoded = bodyText;
+        try {
+            decoded = atob(bodyText);
+        } catch {
+
+        }
+
+        const lines = decoded.split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+        const nodeLines = lines.filter(line => /^[a-z][a-z0-9+.-]*:\/\//i.test(line) && !line.toLowerCase().startsWith('status='));
+
+        const nodeCount = nodeLines.length;
+        if (nodeCount === 0) return { protocolType: null, nodeCount: 0 };
+
+        const protocolCounter = new Map();
+        for (const line of nodeLines) {
+            const p = detectProtocolType(line) || '其他';
+            protocolCounter.set(p, (protocolCounter.get(p) || 0) + 1);
+        }
+
+        let protocolType = '未知';
+        let maxCount = -1;
+        for (const [k, v] of protocolCounter.entries()) {
+            if (v > maxCount) {
+                maxCount = v;
+                protocolType = k;
+            }
+        }
+
+        return { protocolType, nodeCount };
+    } catch {
+        return { protocolType: null, nodeCount: 0 };
+    }
+}
+
 function formatOutput(subUrl, info) {
     const used = info.upload + info.download;
     const remaining = Math.max(info.total - used, 0);
@@ -365,7 +442,7 @@ function formatOutput(subUrl, info) {
     const expireDate = expireDateObj.toLocaleString("zh-CN", {
         timeZone: "Asia/Shanghai",
         hour12: false
-    }).replace(/\//g, "-");
+    });
 
     const now = Date.now();
     const diffMs = info.expire * 1000 - now;
@@ -380,7 +457,15 @@ function formatOutput(subUrl, info) {
         ? `流量重置: ${info.resetDays}小时\n`
         : "";
 
-    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${resetLine}过期时间: ${expireDate}\n剩余时间: ${remainingTime}`;
+    const protocolLine = info.protocolType && info.protocolType !== "未知"
+        ? `协议类型: ${info.protocolType}\n`
+        : "";
+
+    const nodeCountLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0
+        ? `节点总数: ${info.nodeCount}\n`
+        : "";
+
+    return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${protocolLine}${nodeCountLine}${resetLine}过期时间: ${expireDate} (剩余${days}天)\n剩余时间: ${remainingTime}`;
 }
 
 function generateProgressBar(percentage) {
