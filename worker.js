@@ -1,5 +1,5 @@
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         const url = new URL(request.url);
         let botToken;
         try {
@@ -101,18 +101,11 @@ export default {
                     return new Response('OK');
                 }
 
-                const outputs = [];
-                for (const subUrl of subUrls) {
-                    try {
-                        const info = await querySubscription(subUrl);
-                        outputs.push(formatOutput(subUrl, info));
-                    } catch (e) {
-                        outputs.push(`订阅链接: ${subUrl}\n查询失败: ${e.message}`);
-                    }
-                }
-
-                const merged = outputs.join("\n\n────────────\n\n");
-                await sendLongMessage(botToken, update.message.chat.id, merged);
+                await sendMessage(botToken, update.message.chat.id, `⏳ 已识别 ${subUrls.length} 条链接，正在分批查询并回传结果...`);
+                ctx.waitUntil(processSubscriptionsInBatches(botToken, update.message.chat.id, subUrls, {
+                    batchSize: 5,
+                    concurrency: 3
+                }));
                 return new Response('OK');
             } else if (update.inline_query && update.inline_query.query) {
                 const userId = update.inline_query.from.id;
@@ -698,6 +691,49 @@ function generateProgressBar(percentage) {
     const totalBlocks = 11;
     const filled = Math.round((normalized / 100) * totalBlocks);
     return "[" + "■".repeat(filled) + "□".repeat(totalBlocks - filled) + "]";
+}
+
+async function processSubscriptionsWithLimit(subUrls, concurrency = 3) {
+    const results = new Array(subUrls.length);
+    let index = 0;
+
+    async function worker() {
+        while (true) {
+            const current = index;
+            index += 1;
+            if (current >= subUrls.length) break;
+
+            const subUrl = subUrls[current];
+            try {
+                const info = await querySubscription(subUrl);
+                results[current] = formatOutput(subUrl, info);
+            } catch (e) {
+                results[current] = `订阅链接: ${subUrl}\n查询失败: ${e.message}`;
+            }
+        }
+    }
+
+    const count = Math.max(1, Math.min(concurrency, 5));
+    await Promise.all(Array.from({ length: count }, () => worker()));
+    return results;
+}
+
+async function processSubscriptionsInBatches(token, chatId, subUrls, options = {}) {
+    const batchSize = Math.max(1, Math.min(options.batchSize || 5, 10));
+    const concurrency = Math.max(1, Math.min(options.concurrency || 3, 5));
+    const total = subUrls.length;
+    const totalBatches = Math.ceil(total / batchSize);
+
+    for (let i = 0; i < totalBatches; i++) {
+        const start = i * batchSize;
+        const end = Math.min(start + batchSize, total);
+        const currentBatch = subUrls.slice(start, end);
+
+        const outputs = await processSubscriptionsWithLimit(currentBatch, concurrency);
+        const header = `📦 批次 ${i + 1}/${totalBatches}（第 ${start + 1}-${end} 条，共 ${total} 条）`;
+        const merged = `${header}\n\n${outputs.join("\n\n────────────\n\n")}`;
+        await sendLongMessage(token, chatId, merged);
+    }
 }
 
 async function sendLongMessage(token, chatId, text) {
