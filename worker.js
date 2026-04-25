@@ -111,9 +111,9 @@ export default {
         await sendMessage(botToken, chatId, `⏳ 已识别 ${subUrls.length} 条链接，正在汇总查询结果...`);
         ctx.waitUntil(processSubscriptionsCombined(botToken, chatId, subUrls, {
           env,
-          concurrency: 4,
+          concurrency: 2,
           hide403InMulti: false,
-          fastMode: subUrls.length >= 6
+          fastMode: true
         }));
         return new Response("OK");
       }
@@ -226,45 +226,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
 function getSubscriptionUserAgents(fastMode) {
   const list = [
     "clash-meta",
-    "Clash.Meta",
-    "ClashforWindows/0.20.39",
-    "Clash Verge/1.7.7",
     "sing-box/1.10.0",
-    "Stash/2.6.5",
-    "Shadowrocket/2.2.64",
-    "Quantumult X/1.5.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
   ];
-  return fastMode ? list.slice(0, 4) : list;
+  return fastMode ? list.slice(0, 2) : list;
 }
 
-function pseudoClientIp(seedText) {
-  let hash = 2166136261;
-  const text = String(seedText || "HelloSub");
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  const a = 43 + (Math.abs(hash) % 50);
-  const b = (Math.abs(hash >> 8) % 200) + 1;
-  const c = (Math.abs(hash >> 16) % 200) + 1;
-  const d = (Math.abs(hash >> 24) % 200) + 1;
-  return `${a}.${b}.${c}.${d}`;
-}
-
-function buildSubscriptionHeaders(ua, subUrl) {
-  const ip = pseudoClientIp(subUrl);
+function buildSubscriptionHeaders(ua) {
   return {
     "Accept": "text/plain, application/yaml, application/x-yaml, application/octet-stream, */*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
-    "User-Agent": ua,
-    "X-Requested-With": "XMLHttpRequest",
-    "X-Forwarded-For": ip,
-    "X-Real-IP": ip,
-    "Client-IP": ip,
-    "CF-Connecting-IP": ip
+    "User-Agent": ua
   };
 }
 
@@ -272,8 +246,8 @@ function isLikelyBlockedStatus(status) {
   return [401, 403, 406, 407, 418, 429, 451, 503].includes(Number(status));
 }
 
-async function fetchSubscriptionSmart(subUrl, ua, env, timeoutMs = 9000) {
-  const headers = buildSubscriptionHeaders(ua, subUrl);
+async function fetchSubscriptionSmart(subUrl, ua, env, timeoutMs = 5000) {
+  const headers = buildSubscriptionHeaders(ua);
   let directError = null;
 
   try {
@@ -390,7 +364,7 @@ async function querySubscription(subUrl, options = {}) {
   const userAgents = getSubscriptionUserAgents(fastMode);
 
   try {
-    const primary = await fetchBestSubscriptionResponse([subUrl], userAgents, env, { timeoutMs: 10000 });
+    const primary = await fetchBestSubscriptionResponse([subUrl], userAgents, env, { timeoutMs: 5000 });
     const response = primary.response;
 
     const userinfo = response.headers.get("Subscription-Userinfo");
@@ -463,7 +437,7 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, option
     let best = fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
 
     const variantResponse = await fetchBestSubscriptionResponse(variants, userAgents, env, {
-      timeoutMs: 8000,
+      timeoutMs: 3500,
       preferUserInfo: false
     });
 
