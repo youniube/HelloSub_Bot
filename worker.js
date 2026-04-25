@@ -141,7 +141,7 @@ export default {
           return new Response("OK");
         }
 
-        const info = await querySubscription(subUrl, { env });
+        const info = await querySubscription(subUrl, { env, fastMode: true });
         const output = formatOutput(subUrl, info);
         const results = [{
           type: "article",
@@ -374,28 +374,50 @@ async function querySubscription(subUrl, options = {}) {
     const contentDisposition = response.headers.get("content-disposition");
 
     let configName = extractConfigName(profileTitle, contentDisposition, webPageUrl, subUrl);
-    let resetDays = updateInterval ? parseInt(updateInterval, 10) : null;
+    const resetDays = updateInterval ? parseInt(updateInterval, 10) : null;
+    const expireFromHeaders = extractExpireFromHeaders(response.headers);
 
     let bodyInfo = await parseSubscriptionBodyInfo(response.clone());
-    if (!bodyInfo.nodeCount || bodyInfo.nodeCount <= 0) {
-      bodyInfo = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo, { fastMode, env });
+    let primaryStatusInfo = null;
+
+    if (!userinfo || !bodyInfo.nodeCount || !bodyInfo.protocolTypes.length || !expireFromHeaders) {
+      try {
+        const decodedBody = decodeSubscriptionText(await response.clone().text());
+        primaryStatusInfo = parseStatusLineInfo(decodedBody);
+      } catch {
+        // ignore
+      }
     }
 
-    if (bodyInfo && bodyInfo.configNameHint && bodyInfo.configNameHint !== "未知") {
-      configName = bodyInfo.configNameHint;
-    }
+    let result;
 
     if (!userinfo) {
-      const bodyText = await response.text();
-      const decodedBody = decodeSubscriptionText(bodyText);
-      const statusInfo = parseStatusLineInfo(decodedBody);
-
-      if (!statusInfo) {
+      if (!primaryStatusInfo) {
         throw new Error("该订阅没有设置节点流量信息，且未返回 Subscription-Userinfo 头");
       }
 
-      return {
-        ...statusInfo,
+      result = {
+        ...primaryStatusInfo,
+        configName,
+        resetDays: Number.isFinite(resetDays) ? resetDays : null,
+        protocolTypes: bodyInfo.protocolTypes || [],
+        nodeCount: bodyInfo.nodeCount || 0,
+        regions: bodyInfo.regions || [],
+        regionStats: bodyInfo.regionStats || {},
+        fetchVia: primary.via
+      };
+    } else {
+      const params = new Map();
+      userinfo.split(";").forEach(pair => {
+        const [key, value] = pair.trim().split("=");
+        if (key && value) params.set(key.trim().toLowerCase(), parseInt(value.trim(), 10));
+      });
+
+      result = {
+        upload: params.get("upload") || 0,
+        download: params.get("download") || 0,
+        total: params.get("total") || 0,
+        expire: params.get("expire") || expireFromHeaders || primaryStatusInfo?.expire || 0,
         configName,
         resetDays: Number.isFinite(resetDays) ? resetDays : null,
         protocolTypes: bodyInfo.protocolTypes || [],
@@ -406,63 +428,76 @@ async function querySubscription(subUrl, options = {}) {
       };
     }
 
-    const params = new Map();
-    userinfo.split(";").forEach(pair => {
-      const [key, value] = pair.trim().split("=");
-      if (key && value) params.set(key.trim().toLowerCase(), parseInt(value.trim(), 10));
-    });
+    const needSupplement = (!result.expire || result.expire <= 0) || !result.protocolTypes.length || !result.nodeCount;
+    if (needSupplement) {
+      const supplement = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo, { fastMode, env, timeoutMs: 1800 });
+      if (supplement) {
+        bodyInfo = mergeBodyInfo(bodyInfo, supplement);
+        result.protocolTypes = bodyInfo.protocolTypes || [];
+        result.nodeCount = bodyInfo.nodeCount || 0;
+        result.regions = bodyInfo.regions || [];
+        result.regionStats = bodyInfo.regionStats || {};
+        if ((!result.expire || result.expire <= 0) && supplement.expire > 0) result.expire = supplement.expire;
+        if ((configName === "未知" || !configName) && supplement.configNameHint && supplement.configNameHint !== "未知") {
+          result.configName = supplement.configNameHint;
+        }
+      }
+    }
 
-    return {
-      upload: params.get("upload") || 0,
-      download: params.get("download") || 0,
-      total: params.get("total") || 0,
-      expire: params.get("expire") || 0,
-      configName,
-      resetDays: Number.isFinite(resetDays) ? resetDays : null,
-      protocolTypes: bodyInfo.protocolTypes || [],
-      nodeCount: bodyInfo.nodeCount || 0,
-      regions: bodyInfo.regions || [],
-      regionStats: bodyInfo.regionStats || {},
-      fetchVia: primary.via
-    };
+    return result;
   } catch (e) {
     throw new Error(`订阅查询失败: ${e.message}`);
   }
 }
 
 async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, options = {}) {
-  try {
-    const env = options.env || {};
-    const variants = buildSubscriptionVariants(subUrl, { fastMode: !!options.fastMode });
-    let best = fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
+  const env = options.env || {};
+  const timeoutMs = Math.max(1000, Math.min(options.timeoutMs || 1800, 2500));
+  const variants = buildSubscriptionVariants(subUrl, { fastMode: true }).slice(0, 3);
+  const probeUa = (userAgents && userAgents[0]) || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
-    const variantResponse = await fetchBestSubscriptionResponse(variants, userAgents, env, {
-      timeoutMs: 3500,
-      preferUserInfo: false
-    });
+  let best = fallbackInfo || emptyBodyInfo();
+  let bestExpire = 0;
+  let configNameHint = "";
 
-    const info = await parseSubscriptionBodyInfo(variantResponse.response.clone());
-    const candidateConfigName = extractConfigName(
-      variantResponse.response.headers.get("profile-title"),
-      variantResponse.response.headers.get("content-disposition"),
-      variantResponse.response.headers.get("profile-web-page-url"),
-      variantResponse.sourceUrl
-    );
+  for (const candidate of variants) {
+    try {
+      const result = await fetchSubscriptionSmart(candidate, probeUa, env, timeoutMs);
+      const res = result.response;
+      if (!res.ok) continue;
 
-    const enrichedInfo = {
-      ...info,
-      sourceUrl: variantResponse.sourceUrl,
-      configNameHint: candidateConfigName
-    };
+      const info = await parseSubscriptionBodyInfo(res.clone());
+      const decodedBody = decodeSubscriptionText(await res.clone().text());
+      const statusInfo = parseStatusLineInfo(decodedBody);
+      const expire = extractExpireFromHeaders(res.headers) || statusInfo?.expire || 0;
+      const candidateConfigName = extractConfigName(
+        res.headers.get("profile-title"),
+        res.headers.get("content-disposition"),
+        res.headers.get("profile-web-page-url"),
+        candidate
+      );
 
-    if ((enrichedInfo.nodeCount || 0) > (best.nodeCount || 0)) {
-      best = enrichedInfo;
+      if (isBetterBodyInfo(info, best)) {
+        best = { ...info };
+      }
+      if (expire > bestExpire) bestExpire = expire;
+      if ((!configNameHint || configNameHint === "未知") && candidateConfigName && candidateConfigName !== "未知") {
+        configNameHint = candidateConfigName;
+      }
+
+      if ((best.nodeCount || 0) > 0 && best.protocolTypes && best.protocolTypes.length > 0 && bestExpire > 0) {
+        break;
+      }
+    } catch {
+      // ignore
     }
-
-    return best;
-  } catch {
-    return fallbackInfo || { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
   }
+
+  return {
+    ...(best || emptyBodyInfo()),
+    expire: bestExpire || 0,
+    configNameHint: configNameHint || ""
+  };
 }
 
 function buildSubscriptionVariants(subUrl, options = {}) {
@@ -495,6 +530,69 @@ function buildSubscriptionVariants(subUrl, options = {}) {
   }
 
   return Array.from(variants);
+}
+
+function extractExpireFromHeaders(headers) {
+  if (!headers) return 0;
+  const candidates = [
+    headers.get("subscription-expire"),
+    headers.get("profile-expire"),
+    headers.get("x-subscription-expire"),
+    headers.get("x-profile-expire"),
+    headers.get("x-expire-time"),
+    headers.get("expire"),
+    headers.get("expires")
+  ].filter(Boolean);
+
+  for (const value of candidates) {
+    const parsed = parseExpireValue(value);
+    if (parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+function parseExpireValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+
+  if (/^\d{10}$/.test(raw)) return parseInt(raw, 10);
+  if (/^\d{13}$/.test(raw)) return Math.floor(parseInt(raw, 10) / 1000);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return Math.floor(new Date(`${raw}T00:00:00Z`).getTime() / 1000);
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(raw)) {
+    const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+    const ts = Date.parse(/Z$|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+    return Number.isFinite(ts) ? Math.floor(ts / 1000) : 0;
+  }
+
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? Math.floor(ts / 1000) : 0;
+}
+
+function isBetterBodyInfo(candidate, current) {
+  const a = candidate || emptyBodyInfo();
+  const b = current || emptyBodyInfo();
+  const scoreA = (a.nodeCount || 0) * 10 + (a.protocolTypes?.length || 0) * 4 + (a.regions?.length || 0);
+  const scoreB = (b.nodeCount || 0) * 10 + (b.protocolTypes?.length || 0) * 4 + (b.regions?.length || 0);
+  return scoreA > scoreB;
+}
+
+function mergeBodyInfo(primary, supplement) {
+  const p = primary || emptyBodyInfo();
+  const s = supplement || emptyBodyInfo();
+  const protocolTypes = Array.from(new Set([...(p.protocolTypes || []), ...(s.protocolTypes || [])]));
+  const regions = sortRegions(Array.from(new Set([...(p.regions || []), ...(s.regions || [])])));
+  const regionStats = { ...(p.regionStats || {}) };
+  for (const [region, count] of Object.entries(s.regionStats || {})) {
+    regionStats[region] = Math.max(regionStats[region] || 0, count || 0);
+  }
+
+  return {
+    protocolTypes,
+    nodeCount: Math.max(p.nodeCount || 0, s.nodeCount || 0),
+    regions,
+    regionStats,
+    configNameHint: s.configNameHint || p.configNameHint || ""
+  };
 }
 
 function b64DecodeUtf8(input) {
@@ -667,8 +765,14 @@ function stripConfigExt(name) {
   return String(name || "").replace(/\.(ya?ml|txt|conf|json)$/i, "");
 }
 
-function detectProtocolType(url) {
-  const lower = String(url || "").toLowerCase();
+function detectProtocolType(input) {
+  const lower = String(input || "").toLowerCase();
+  if (!lower) return null;
+
+  if (lower.includes("proxies:")) return "Clash";
+  if (lower.includes("proxy-providers:")) return "Clash";
+  if (lower.includes("mixed-port:") || lower.includes("proxy-groups:")) return "Clash";
+
   if (lower.startsWith("ss://")) return "Shadowsocks";
   if (lower.startsWith("ssr://")) return "ShadowsocksR";
   if (lower.startsWith("vmess://")) return "VMess";
@@ -703,6 +807,9 @@ async function parseSubscriptionBodyInfo(response) {
     const regionStats = {};
     const seen = new Set();
 
+    const wholeBodyProtocol = detectProtocolType(decoded);
+    if (wholeBodyProtocol) protocolSet.add(wholeBodyProtocol);
+
     for (const line of uriNodeLines) {
       const protocol = detectProtocolType(line);
       if (!protocol) continue;
@@ -732,6 +839,10 @@ async function parseSubscriptionBodyInfo(response) {
         regionSet.add(region);
         regionStats[region] = (regionStats[region] || 0) + 1;
       }
+    }
+
+    if (!protocolSet.size && /^(proxies:|proxy-providers:|mixed-port:|proxy-groups:)/mi.test(decoded)) {
+      protocolSet.add("Clash");
     }
 
     return {
@@ -983,9 +1094,10 @@ async function processSubscriptionsWithLimit(subUrls, options = {}) {
       } catch (e) {
         const errMsg = String(e && e.message ? e.message : e);
         const is403 = /\b403\b/.test(errMsg);
+        const isTimeout = /timeout|aborted|The operation was aborted/i.test(errMsg);
         const shouldHide = hide403InMulti && is403;
         results[current] = {
-          text: shouldHide ? "" : `订阅链接: ${subUrl}\n查询失败: ${errMsg}`,
+          text: shouldHide ? "" : `订阅链接: ${subUrl}\n查询失败: ${isTimeout ? "请求超时（目标站响应过慢或阻断）" : errMsg}`,
           status: "failed",
           hidden: shouldHide
         };
