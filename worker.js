@@ -108,7 +108,11 @@ export default {
           return new Response("OK");
         }
 
-        await sendMessage(botToken, chatId, `⏳ 已识别 ${subUrls.length} 条链接，正在汇总查询结果...`);
+        if (subUrls.length === 1) {
+          ctx.waitUntil(processSingleSubscription(botToken, chatId, subUrls[0], { env, fastMode: true }));
+          return new Response("OK");
+        }
+
         ctx.waitUntil(processSubscriptionsCombined(botToken, chatId, subUrls, {
           env,
           concurrency: 2,
@@ -1043,28 +1047,21 @@ function formatOutput(subUrl, info) {
   const expireDateObj = new Date(Number(info.expire || 0) * 1000);
   const expireDate = info.expire > 0
     ? expireDateObj.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })
-    : "未提供";
+    : "长期有效";
 
   const now = Date.now();
   const diffMs = Number(info.expire || 0) * 1000 - now;
   const safeDiff = Math.max(diffMs, 0);
   const days = Math.floor(safeDiff / (1000 * 60 * 60 * 24));
-  const hours = Math.floor((safeDiff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-  const minutes = Math.floor((safeDiff % (1000 * 60 * 60)) / (1000 * 60));
-  const seconds = Math.floor((safeDiff % (1000 * 60)) / 1000);
-  const remainingTime = info.expire > 0 ? `${days}天${hours}时${minutes}分${seconds}秒` : "未知";
 
-  const protocolText = info.protocolTypes && info.protocolTypes.length > 0 ? info.protocolTypes.join(", ") : "未知";
   const sortedRegions = info.regions && info.regions.length > 0 ? sortRegions(info.regions) : [];
   const regionCount = sortedRegions.length;
   const nodeLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0 ? `节点总数: ${info.nodeCount} | 国家/地区: ${regionCount}\n` : "";
   const coverageLine = regionCount > 0 ? `覆盖范围: ${sortedRegions.join("、")}\n` : "";
-  const regionStats = info.regionStats || {};
-  const regionDistribution = sortedRegions.map(region => `${region} ${regionStats[region] || 0}`).join("｜");
-  const regionDistributionLine = regionDistribution ? `地区分布: ${regionDistribution}\n` : "";
   const viaLine = info.fetchVia === "proxy" ? "拉取方式: 非 Cloudflare 中转\n" : "";
+  const expireLine = `过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ""}`;
 
-  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n协议类型: ${protocolText}\n${nodeLine}${coverageLine}${regionDistributionLine}${viaLine}过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ""}\n剩余时间: ${remainingTime}`;
+  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${nodeLine}${coverageLine}${viaLine}${expireLine}`;
 }
 
 function generateProgressBar(percentage) {
@@ -1137,6 +1134,17 @@ async function processSubscriptionsCombined(token, chatId, subUrls, options = {}
 
   await sendMessage(token, chatId, `📊 有效: ${summary.valid} | 耗尽: ${summary.exhausted} | 过期: ${summary.expired} | 失败: ${summary.failed}`);
   await sendMessage(token, chatId, `✅ 查询完成，共 ${total} 条。`);
+}
+
+async function processSingleSubscription(token, chatId, subUrl, options = {}) {
+  try {
+    const info = await querySubscription(subUrl, { fastMode: !!options.fastMode, env: options.env || {} });
+    await sendLongMessage(token, chatId, formatOutput(subUrl, info));
+  } catch (e) {
+    const errMsg = String(e && e.message ? e.message : e);
+    const isTimeout = /timeout|aborted|The operation was aborted/i.test(errMsg);
+    await sendMessage(token, chatId, `订阅链接: ${subUrl}\n查询失败: ${isTimeout ? "请求超时（目标站响应过慢或阻断）" : errMsg}`);
+  }
 }
 
 function evaluateSubscriptionStatus(info) {
