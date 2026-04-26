@@ -432,9 +432,15 @@ async function querySubscription(subUrl, options = {}) {
       };
     }
 
-    const needSupplement = (!result.expire || result.expire <= 0) || !result.protocolTypes.length || !result.nodeCount;
+    const shouldProbeVariant = isRawSubscriptionUrl(subUrl);
+    const needSupplement = shouldProbeVariant || (!result.expire || result.expire <= 0) || !result.protocolTypes.length || !result.nodeCount;
     if (needSupplement) {
-      const supplement = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo, { fastMode, env, timeoutMs: 1800 });
+      const supplement = await enrichBodyInfoByVariants(subUrl, userAgents, bodyInfo, {
+        fastMode,
+        env,
+        timeoutMs: shouldProbeVariant ? 2200 : 1800,
+        singleBestVariant: shouldProbeVariant
+      });
       if (supplement) {
         bodyInfo = mergeBodyInfo(bodyInfo, supplement);
         result.protocolTypes = bodyInfo.protocolTypes || [];
@@ -456,8 +462,11 @@ async function querySubscription(subUrl, options = {}) {
 
 async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, options = {}) {
   const env = options.env || {};
-  const timeoutMs = Math.max(1000, Math.min(options.timeoutMs || 1800, 2500));
-  const variants = buildSubscriptionVariants(subUrl, { fastMode: true }).slice(0, 3);
+  const timeoutMs = Math.max(1000, Math.min(options.timeoutMs || 1800, 3000));
+  const variants = buildSubscriptionVariants(subUrl, {
+    fastMode: true,
+    singleBestVariant: !!options.singleBestVariant
+  });
   const probeUa = (userAgents && userAgents[0]) || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
   let best = fallbackInfo || emptyBodyInfo();
@@ -489,7 +498,7 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, option
         configNameHint = candidateConfigName;
       }
 
-      if ((best.nodeCount || 0) > 0 && best.protocolTypes && best.protocolTypes.length > 0 && bestExpire > 0) {
+      if ((best.nodeCount || 0) > 0 && bestExpire > 0) {
         break;
       }
     } catch {
@@ -506,8 +515,8 @@ async function enrichBodyInfoByVariants(subUrl, userAgents, fallbackInfo, option
 
 function buildSubscriptionVariants(subUrl, options = {}) {
   const fastMode = !!options.fastMode;
+  const singleBestVariant = !!options.singleBestVariant;
   const variants = new Set();
-  variants.add(subUrl);
 
   try {
     const url = new URL(subUrl);
@@ -517,6 +526,15 @@ function buildSubscriptionVariants(subUrl, options = {}) {
       variants.add(u.toString());
     };
 
+    if (singleBestVariant) {
+      appendVariant((p) => p.set("clash", "1"));
+      appendVariant((p) => { p.set("clash", "3"); p.set("extend", "1"); });
+      appendVariant((p) => p.set("target", "clash"));
+      appendVariant((p) => { p.set("target", "clash"); p.set("list", "1"); });
+      return Array.from(variants);
+    }
+
+    variants.add(subUrl);
     appendVariant((p) => { p.set("clash", "3"); p.set("extend", "1"); });
     appendVariant((p) => p.set("target", "clash"));
     appendVariant((p) => { p.set("target", "clash"); p.set("list", "1"); });
@@ -534,6 +552,20 @@ function buildSubscriptionVariants(subUrl, options = {}) {
   }
 
   return Array.from(variants);
+}
+
+function isRawSubscriptionUrl(subUrl) {
+  try {
+    const url = new URL(subUrl);
+    const path = url.pathname.toLowerCase();
+    const hasRawIndicators = ["token", "sub", "subscription", "client"].some(k =>
+      path.includes(k) || url.searchParams.has(k)
+    );
+    const hasStructuredVariant = ["clash", "target", "list", "flag", "types", "extend"].some(k => url.searchParams.has(k));
+    return hasRawIndicators && !hasStructuredVariant;
+  } catch {
+    return false;
+  }
 }
 
 function extractExpireFromHeaders(headers) {
