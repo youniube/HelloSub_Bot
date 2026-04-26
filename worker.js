@@ -715,7 +715,7 @@ function parseStatusLineInfo(text) {
 function pickStatusNumber(line, keys) {
   for (const key of keys) {
     const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`${escaped}\s*[:=]\s*([\d.]+)\s*(B|KB|MB|GB|TB)?`, "i");
+    const re = new RegExp(`${escaped}\\s*[:=]\\s*([\\d.]+)\\s*(B|KB|MB|GB|TB)?`, "i");
     const m = String(line).match(re);
     if (m) return sizeToBytes(parseFloat(m[1]), m[2] || "GB");
   }
@@ -959,7 +959,7 @@ function cleanYamlValue(value) {
 }
 
 function pickYamlValue(line, key) {
-  const re = new RegExp(`(?:^|[,{]\s*)${key}\s*:\s*(?:"([^"]*)"|'([^']*)'|([^,}]+))`, "i");
+  const re = new RegExp(`(?:^|[,{]\\s*)${key}\\s*:\\s*(?:"([^"]*)"|'([^']*)'|([^,}]+))`, "i");
   const m = String(line || "").match(re);
   return cleanYamlValue(m?.[1] || m?.[2] || m?.[3] || "");
 }
