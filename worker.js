@@ -1139,6 +1139,8 @@ function formatOutput(subUrl, info) {
   const safeDiff = Math.max(diffMs, 0);
   const days = Math.floor(safeDiff / (1000 * 60 * 60 * 24));
 
+  const protocolText = info.protocolTypes && info.protocolTypes.length > 0 ? info.protocolTypes.join(", ") : "";
+  const protocolLine = protocolText ? `协议类型: ${protocolText}\n` : "";
   const sortedRegions = info.regions && info.regions.length > 0 ? sortRegions(info.regions) : [];
   const regionCount = sortedRegions.length;
   const nodeLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0 ? `节点总数: ${info.nodeCount} | 国家/地区: ${regionCount}\n` : "";
@@ -1147,7 +1149,7 @@ function formatOutput(subUrl, info) {
   const statusLine = info.anomaly ? `订阅状态: ${info.anomaly.title}\n说明: ${info.anomaly.detail}\n` : "";
   const expireLine = `过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ""}`;
 
-  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${statusLine}${nodeLine}${coverageLine}${viaLine}${expireLine}`;
+  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${protocolLine}${statusLine}${nodeLine}${coverageLine}${viaLine}${expireLine}`;
 }
 
 function generateProgressBar(percentage) {
