@@ -1125,9 +1125,9 @@ function formatOutput(subUrl, info) {
   const progress = total > 0 ? (used / total) * 100 : 0;
   const progressBar = generateProgressBar(progress);
 
-  const usedGB = (used / (1024 ** 3)).toFixed(2);
-  const totalGB = (total / (1024 ** 3)).toFixed(2);
-  const remainingGB = (remaining / (1024 ** 3)).toFixed(2);
+  const usedText = formatBytesSmart(used);
+  const totalText = formatBytesSmart(total);
+  const remainingText = formatBytesSmart(remaining);
 
   const expireDateObj = new Date(Number(info.expire || 0) * 1000);
   const expireDate = info.expire > 0
@@ -1139,7 +1139,8 @@ function formatOutput(subUrl, info) {
   const safeDiff = Math.max(diffMs, 0);
   const days = Math.floor(safeDiff / (1000 * 60 * 60 * 24));
 
-  const protocolText = info.protocolTypes && info.protocolTypes.length > 0 ? info.protocolTypes.join(", ") : "";
+  const displayProtocols = normalizeDisplayProtocolTypes(info.protocolTypes);
+  const protocolText = displayProtocols.length > 0 ? displayProtocols.join(", ") : "";
   const protocolLine = protocolText ? `协议类型: ${protocolText}\n` : "";
   const sortedRegions = info.regions && info.regions.length > 0 ? sortRegions(info.regions) : [];
   const regionCount = sortedRegions.length;
@@ -1149,7 +1150,21 @@ function formatOutput(subUrl, info) {
   const statusLine = info.anomaly ? `订阅状态: ${info.anomaly.title}\n说明: ${info.anomaly.detail}\n` : "";
   const expireLine = `过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ""}`;
 
-  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${protocolLine}${statusLine}${nodeLine}${coverageLine}${viaLine}${expireLine}`;
+  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedText} / ${totalText}\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingText}\n${protocolLine}${statusLine}${nodeLine}${coverageLine}${viaLine}${expireLine}`;
+}
+
+function formatBytesSmart(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n < 0) return "0.00 GB";
+  const tb = 1024 ** 4;
+  const gb = 1024 ** 3;
+  if (n >= tb) return `${(n / tb).toFixed(2)} TB`;
+  return `${(n / gb).toFixed(2)} GB`;
+}
+
+function normalizeDisplayProtocolTypes(protocolTypes) {
+  const list = Array.isArray(protocolTypes) ? protocolTypes : [];
+  return Array.from(new Set(list.filter(v => v && v !== "Clash")));
 }
 
 function generateProgressBar(percentage) {
