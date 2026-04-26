@@ -408,6 +408,7 @@ async function querySubscription(subUrl, options = {}) {
         nodeCount: bodyInfo.nodeCount || 0,
         regions: bodyInfo.regions || [],
         regionStats: bodyInfo.regionStats || {},
+        anomaly: bodyInfo.anomaly || null,
         fetchVia: primary.via
       };
     } else {
@@ -428,6 +429,7 @@ async function querySubscription(subUrl, options = {}) {
         nodeCount: bodyInfo.nodeCount || 0,
         regions: bodyInfo.regions || [],
         regionStats: bodyInfo.regionStats || {},
+        anomaly: bodyInfo.anomaly || null,
         fetchVia: primary.via
       };
     }
@@ -447,6 +449,7 @@ async function querySubscription(subUrl, options = {}) {
         result.nodeCount = bodyInfo.nodeCount || 0;
         result.regions = bodyInfo.regions || [];
         result.regionStats = bodyInfo.regionStats || {};
+        result.anomaly = bodyInfo.anomaly || result.anomaly || null;
         if ((!result.expire || result.expire <= 0) && supplement.expire > 0) result.expire = supplement.expire;
         if ((configName === "未知" || !configName) && supplement.configNameHint && supplement.configNameHint !== "未知") {
           result.configName = supplement.configNameHint;
@@ -622,11 +625,18 @@ function mergeBodyInfo(primary, supplement) {
     regionStats[region] = Math.max(regionStats[region] || 0, count || 0);
   }
 
+  const nodeNames = Array.from(new Set([...(p.nodeNames || []), ...(s.nodeNames || [])]));
+  const servers = Array.from(new Set([...(p.servers || []), ...(s.servers || [])]));
+  const anomaly = s.anomaly || p.anomaly || null;
+
   return {
     protocolTypes,
     nodeCount: Math.max(p.nodeCount || 0, s.nodeCount || 0),
     regions,
     regionStats,
+    nodeNames,
+    servers,
+    anomaly,
     configNameHint: s.configNameHint || p.configNameHint || ""
   };
 }
@@ -738,6 +748,39 @@ function decodeRFC5987(value) {
   }
 }
 
+function containsSuspiciousConfigMarker(text) {
+  const value = String(text || "").toLowerCase();
+  if (!value) return false;
+  const keywords = [
+    "封禁", "已被封禁", "账号已被封禁", "客服", "查明原因", "官网地址",
+    "banned", "forbidden", "contact support", "suspended", "disabled"
+  ];
+  return keywords.some(k => value.includes(String(k).toLowerCase()));
+}
+
+function evaluateSubscriptionAnomaly(bodyInfo = {}) {
+  const names = Array.isArray(bodyInfo.nodeNames) ? bodyInfo.nodeNames.filter(Boolean) : [];
+  if (!names.length) return null;
+
+  const suspicious = names.filter(name => containsSuspiciousConfigMarker(name));
+  if (!suspicious.length) return null;
+
+  const suspiciousRate = suspicious.length / names.length;
+  const localhostOnly = Array.isArray(bodyInfo.servers) && bodyInfo.servers.length > 0 && bodyInfo.servers.every(server =>
+    ["127.0.0.1", "localhost", "0.0.0.0"].includes(String(server || "").toLowerCase())
+  );
+
+  if (suspiciousRate >= 0.5 || localhostOnly) {
+    return {
+      code: "suspicious_placeholder",
+      title: "异常（疑似封禁）",
+      detail: "当前返回的是提示配置，不是真实节点"
+    };
+  }
+
+  return null;
+}
+
 function decodeMaybeUriComponent(text) {
   if (!text) return text;
   try {
@@ -842,6 +885,8 @@ async function parseSubscriptionBodyInfo(response) {
     const regionSet = new Set();
     const regionStats = {};
     const seen = new Set();
+    const nodeNames = [];
+    const servers = [];
 
     const wholeBodyProtocol = detectProtocolType(decoded);
     if (wholeBodyProtocol) protocolSet.add(wholeBodyProtocol);
@@ -854,6 +899,7 @@ async function parseSubscriptionBodyInfo(response) {
       if (seen.has(key)) continue;
       seen.add(key);
       protocolSet.add(protocol);
+      if (nodeName) nodeNames.push(nodeName);
 
       const region = detectRegionFromName(nodeName || line);
       if (region) {
@@ -869,6 +915,8 @@ async function parseSubscriptionBodyInfo(response) {
       if (seen.has(key)) continue;
       seen.add(key);
       protocolSet.add(normalizedType);
+      if (node.name) nodeNames.push(node.name);
+      if (node.server) servers.push(String(node.server));
 
       const region = detectRegionFromName(node.name || "");
       if (region) {
@@ -881,11 +929,16 @@ async function parseSubscriptionBodyInfo(response) {
       protocolSet.add("Clash");
     }
 
+    const anomaly = evaluateSubscriptionAnomaly({ nodeNames, servers });
+
     return {
       protocolTypes: Array.from(protocolSet),
       nodeCount: seen.size,
       regions: sortRegions(Array.from(regionSet)),
-      regionStats
+      regionStats,
+      nodeNames,
+      servers,
+      anomaly
     };
   } catch (e) {
     console.error("解析订阅正文失败:", e.message);
@@ -894,7 +947,7 @@ async function parseSubscriptionBodyInfo(response) {
 }
 
 function emptyBodyInfo() {
-  return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {} };
+  return { protocolTypes: [], nodeCount: 0, regions: [], regionStats: {}, nodeNames: [], servers: [], anomaly: null };
 }
 
 function cleanYamlValue(value) {
@@ -1091,9 +1144,10 @@ function formatOutput(subUrl, info) {
   const nodeLine = Number.isFinite(info.nodeCount) && info.nodeCount > 0 ? `节点总数: ${info.nodeCount} | 国家/地区: ${regionCount}\n` : "";
   const coverageLine = regionCount > 0 ? `覆盖范围: ${sortedRegions.join("、")}\n` : "";
   const viaLine = info.fetchVia === "proxy" ? "拉取方式: 非 Cloudflare 中转\n" : "";
+  const statusLine = info.anomaly ? `订阅状态: ${info.anomaly.title}\n说明: ${info.anomaly.detail}\n` : "";
   const expireLine = `过期时间: ${expireDate}${info.expire > 0 ? ` (剩余${days}天)` : ""}`;
 
-  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${nodeLine}${coverageLine}${viaLine}${expireLine}`;
+  return `配置名称: ${info.configName}\n订阅链接: ${subUrl}\n流量详情: ${usedGB} GB / ${totalGB} GB\n使用进度: ${progressBar} ${progress.toFixed(1)}%\n剩余可用: ${remainingGB} GB\n${statusLine}${nodeLine}${coverageLine}${viaLine}${expireLine}`;
 }
 
 function generateProgressBar(percentage) {
